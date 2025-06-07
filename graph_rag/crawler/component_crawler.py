@@ -35,48 +35,143 @@ class SelectorDiscoveryStrategy(DiscoveryStrategy):
     async def discover_components(self, page: Page) -> List[Component]:
         """Discover components from storybook explorer tree."""
         components = []
+        discovered_urls = set()  # Track unique URLs to avoid duplicates during discovery
         
         try:
             # Wait for explorer tree to be visible
             tree = page.locator('#storybook-explorer-tree')
             await tree.wait_for(state='visible', timeout=self.config.discovery_timeout * 1000)
             
-            # Find all links in explorer tree
-            links = await tree.locator('a[href]').all()
+            # Recursively expand all collapsible elements to reveal all nested components
+            await self._expand_all_hierarchies(tree, page)
             
-            # Also find expandable items that may contain nested links
-            expandable_items = await tree.locator('[data-nodetype="group"]').all()
-            for item in expandable_items:
-                try:
-                    await item.click()
-                    nested_links = await tree.locator('a[href]').all()
-                    links.extend(nested_links)
-                except Exception as e:
-                    print(f"Warning: Could not expand item - {str(e)}")
-                    continue
+            # Wait for all expansions to stabilize
+            await page.wait_for_timeout(2000)
+            
+            # Now find all links in the fully expanded explorer tree
+            all_links = await tree.locator('a[href]').all()
+            print(f"Found {len(all_links)} total links after expansion")
             
             # Process all found links
-            for link in links:
+            for i, link in enumerate(all_links):
                 try:
                     href = await link.get_attribute('href')
                     if not href:
                         continue
                     
+                    # Skip if we've already discovered this URL
+                    if href in discovered_urls:
+                        continue
+                    
+                    # Get link text for component name
+                    name = await link.text_content()
+                    if not name:
+                        name = href
+                    
+                    # Clean up name
+                    name = name.strip()
+                    if not name:
+                        name = f"Component_{i}"
+                    
                     # Create component from href
                     component = Component(
-                        name=await link.text_content() or href,
+                        name=name,
                         url=href,
                         selectors=[str(link)]
                     )
                     components.append(component)
+                    discovered_urls.add(href)
+                    print(f"Discovered: {name} -> {href}")
+                    
                 except Exception as e:
-                    print(f"Warning: Could not process link - {str(e)}")
+                    print(f"Warning: Could not process link {i} - {str(e)}")
                     continue
         except Exception as e:
             print(f"Error during component discovery: {str(e)}")
             raise
         
+        print(f"Total unique components discovered: {len(components)}")
         return components
+    
+    async def _expand_all_hierarchies(self, tree, page):
+        """Recursively expand all hierarchical elements until no more can be expanded."""
+        max_iterations = 15  # Increased to handle deep hierarchies
+        iteration = 0
+        
+        # Set shorter timeout for faster operations during expansion
+        page.set_default_timeout(1000)  # 1 second
+        
+        try:
+            while iteration < max_iterations:
+                iteration += 1
+                print(f"Expansion iteration {iteration}")
+                
+                # Find all currently expandable elements (both groups and components)
+                # The aria-expanded attribute is on the button element inside the div
+                # Groups: div[data-nodetype="group"] > button[aria-expanded="false"]
+                # Components: div[data-nodetype="component"] > button[aria-expanded="false"]
+                expandable_groups = await tree.locator('[data-nodetype="group"] button[aria-expanded="false"]').all()
+                expandable_components = await tree.locator('[data-nodetype="component"] button[aria-expanded="false"]').all()
+                
+                all_expandable = expandable_groups + expandable_components
+                
+                if not all_expandable:
+                    print(f"No more expandable elements found. Stopping after {iteration} iterations.")
+                    break
+                    
+                print(f"Found {len(all_expandable)} expandable elements ({len(expandable_groups)} groups, {len(expandable_components)} components)")
+                
+                # Expand all found elements
+                expanded_count = 0
+                for i, item in enumerate(all_expandable):
+                    try:
+                        # Try to click the element directly without checking aria-expanded first
+                        # The element was already identified as expandable, so just click it
+                        await item.click()
+                        expanded_count += 1
+                        print(f"  ✓ Expanded element {i+1}/{len(all_expandable)}")
+                        # Small delay between expansions
+                        await page.wait_for_timeout(150)
+                    except Exception as e:
+                        print(f"  ✗ Could not expand element {i+1}/{len(all_expandable)} - {str(e)}")
+                        # If clicking failed, try to get some debug info
+                        try:
+                            node_type = await item.locator('..').get_attribute('data-nodetype')
+                            item_id = await item.locator('..').get_attribute('data-item-id')
+                            print(f"    Failed element info: nodetype={node_type}, item-id={item_id}")
+                        except:
+                            pass
+                        continue
+                
+                print(f"Expanded {expanded_count}/{len(all_expandable)} elements in iteration {iteration}")
+                
+                # Wait for DOM updates after this round of expansions
+                await page.wait_for_timeout(1500)
+                
+                # If we didn't expand anything, we're done
+                if expanded_count == 0:
+                    print(f"No elements were expanded in iteration {iteration}. Stopping.")
+                    break
+                
+                # Show progress: how many total links are visible now
+                current_links = await tree.locator('a[href]').count()
+                print(f"  Current total links visible: {current_links}")
+            
+            if iteration >= max_iterations:
+                print("Warning: Reached maximum iterations for hierarchy expansion")
+            
+        finally:
+            # Reset timeout to default
+            page.set_default_timeout(30000)
+        
+        # Final check: count total expandable elements that might still be collapsed
+        remaining_groups = await tree.locator('[data-nodetype="group"] button[aria-expanded="false"]').count()
+        remaining_components = await tree.locator('[data-nodetype="component"] button[aria-expanded="false"]').count()
+        
+        if remaining_groups > 0 or remaining_components > 0:
+            print(f"Warning: {remaining_groups + remaining_components} elements remain unexpanded ({remaining_groups} groups, {remaining_components} components)")
+        else:
+            print("All hierarchies successfully expanded!")
 
 class ComponentData(BaseModel):
     """Structured data of a design system component."""
