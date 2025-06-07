@@ -1,0 +1,9 @@
+# Core dependencies
+playwright==1.45.0
+beautifulsoup4==4.12.3
+python-dotenv==1.0.1
+aiofiles==23.2.1
+pydantic==2.7.1
+
+# Install Playwright browsers (run after installing dependencies)
+# playwright install chromium
