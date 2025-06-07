@@ -1,4 +1,5 @@
 .venv
 .env
 __pycache__
-process/crawler/*
+process/crawleri/
+
