@@ -6,10 +6,12 @@ dynamic content loaded in Storybook iframe.
 """
 
 import re
+import logging
 from typing import List, Dict, Optional, Tuple
 from bs4 import BeautifulSoup, Tag
 from .data_models import UsageGuideline, CodeExample
 
+logger = logging.getLogger(__name__)
 
 class ContentParser:
     """Parses component documentation and extracts structured content."""
@@ -103,7 +105,8 @@ class ContentParser:
                     elements = soup.select(selector)
                     if elements:
                         return BeautifulSoup(str(elements[0]), 'html.parser')
-            except Exception:
+            except Exception as e:
+                logger.warning(f"Error processing selector '{selector}': {e}")
                 continue
                 
         return None
@@ -190,7 +193,7 @@ class ContentParser:
         
         # Look for elements with do/don't indicators
         do_dont_indicators = [
-            r'\b(do|don\'t|don\'t|avoid|never|always|should|shouldn\'t|must|must not)\b',
+            r'\b(do|don\'t|avoid|never|always|should|shouldn\'t|must|must not)\b',
             r'✓|✗|❌|✅|👍|👎'
         ]
         
@@ -286,7 +289,7 @@ class ContentParser:
         for cls in classes:
             if cls.startswith('language-'):
                 return cls.replace('language-', '')
-            elif cls in ['typescript', 'javascript', 'tsx', 'jsx', 'html', 'css']:
+            elif cls in {'typescript', 'javascript', 'tsx', 'jsx', 'html', 'css'}:
                 return cls
                 
         # Check parent classes
@@ -352,7 +355,7 @@ class ContentParser:
         cleaned = re.sub(r'\s+', ' ', text.strip())
         
         # Remove common code artifacts
-        cleaned = re.sub(r'^Copy$', '', cleaned)  # Copy buttons
+        cleaned = re.sub(r'\bCopy\b', '', cleaned, flags=re.IGNORECASE)  # Case-insensitive, standalone word "Copy"
         cleaned = re.sub(r'^\d+\s*$', '', cleaned)  # Line numbers
         
         return cleaned.strip()
@@ -383,3 +386,39 @@ class ContentParser:
             iframe_content["canvas_text"] = ContentParser._clean_text(canvas_elements[0].get_text())
             
         return iframe_content
+    
+    @staticmethod
+    def parse_html_to_text(html_content: str, main_content_selectors: Optional[List[str]] = None) -> str:
+        soup = BeautifulSoup(html_content, 'html.parser')
+        
+        # Pre-emptive removal of common non-content tags from the entire soup
+        # Added svg and path as they are common in UI libraries and rarely contain useful text for KG.
+        for element in soup(["script", "style", "header", "footer", "nav", "aside", "form", "button", "iframe", "noscript", "svg", "path"]):
+            element.decompose()
+
+        # Attempt to use main_content_selectors if provided
+        if main_content_selectors:
+            selected_texts = []
+            for selector in main_content_selectors:
+                elements = soup.select(selector)
+                for el in elements:
+                    # Clean the selected element further in case it contains nested unwanted tags
+                    # This ensures that even if a main selector grabs a large chunk, unwanted sub-elements are removed.
+                    for sub_element in el(["script", "style", "header", "footer", "nav", "aside", "form", "button", "iframe", "noscript", "svg", "path"]):
+                        sub_element.decompose()
+                    selected_texts.append(el.get_text(separator=' ', strip=True))
+            
+            if selected_texts and any(text.strip() for text in selected_texts):
+                full_text = ' '.join(filter(None, selected_texts))
+                return ' '.join(full_text.split()) # Normalize whitespace
+
+        # Fallback: if no selectors provided, or they yield no text, process the body or the whole document.
+        # The soup has already been cleaned by the initial decompose loop.
+        target_element = soup.find('body') or soup 
+
+        text_content = target_element.get_text(separator=' ', strip=True)
+        
+        # Normalize whitespace (e.g., multiple spaces to one, remove leading/trailing for the whole string)
+        normalized_text = ' '.join(text_content.split())
+        
+        return normalized_text

@@ -88,7 +88,7 @@ class KGExtractor:
         if storybook_root:
             # Found storybook content - extract text from this div
             html_text = storybook_root.get_text(separator='\n', strip=True)
-            logger.debug("Extracted content from #storybook-root")
+            logger.debug(f"Extracted content from #storybook-root: {html_text[:200]}...")
         else:
             # Check if this is an error page
             error_div = soup.find('div', class_='sb-nopreview')
@@ -98,38 +98,53 @@ class KGExtractor:
             else:
                 # Fallback to full text extraction
                 html_text = soup.get_text(separator='\n', strip=True)
-                logger.debug("Using full HTML content as fallback")
+                logger.debug(f"Using full HTML content as fallback: {html_text[:200]}...")
+        
+        # Verify we have clean text (no HTML tags)
+        if "<" in html_text or ">" in html_text:
+            logger.warning("HTML tags detected in extracted text - cleaning")
+            html_text = BeautifulSoup(html_text, 'html.parser').get_text()
         
         # Prepare structured component metadata with enhanced LLM prompt
         description = component_data.metadata.description or "Component documentation"
         if description and "Sorry, but you" in description:
             description = "Component documentation"
             
-        component_text = f"""
-Extract knowledge triplets from this structured component documentation.
-Follow the format: (subject, predicate, object)
-
-Component Metadata:
-- Name: {component_data.metadata.name}
-- Description: {description}
-- Category: {component_data.metadata.category or 'Uncategorized'}
-
-Properties:
-"""
-        # Add properties with structured format
+        # Prepare properties section only if we have valid properties
+        properties_text = ""
         if component_data.properties:
+            properties_text = "\nProperties:\n"
             for prop in component_data.properties:
-                # Skip generic placeholder properties
                 if "short descriptionsummary" not in prop.description.lower():
-                    component_text += f"""
+                    properties_text += f"""
 - Property: {prop.name}
 Type: {prop.type}
 Description: {prop.description}
 Default: {prop.default_value or 'None'}
 Required: {'Yes' if prop.required else 'No'}
 """
+                    # Explicitly relate property to component
+                    properties_text += f"Relation: ({component_data.metadata.name}, has_property, {prop.name})\n"
+        
+        component_text = f"""
+Extract knowledge triplets from this structured component documentation.
+Follow the format: (subject, predicate, object)
 
-        # Add numerical data points if present in HTML
+Examples of valid triplets:
+- (ComponentName, has_property, PropertyName)
+- (PropertyName, has_type, TypeName)
+- (PropertyName, has_default_value, DefaultValue)
+- (ComponentName, has_value, NumericalValue)
+- (PropertyName, has_value, NumericalValue)
+
+Component Metadata:
+- Name: {component_data.metadata.name}
+- Description: {description}
+- Category: {component_data.metadata.category or 'Uncategorized'}
+{properties_text}
+"""
+
+        # Add numerical data points if present in HTML with explicit relations
         soup = BeautifulSoup(html_content, 'html.parser')
         numerical_data = []
         for element in soup.find_all(string=True):
@@ -141,6 +156,12 @@ Required: {'Yes' if prop.required else 'No'}
             component_text += "\nNumerical Data Points:\n"
             for value in numerical_data:
                 component_text += f"- Value: {value}\n"
+                # Explicitly relate numerical values to component
+                component_text += f"Possible relations:\n"
+                component_text += f"({component_data.metadata.name}, has_value, {value})\n"
+                if component_data.properties:
+                    for prop in component_data.properties:
+                        component_text += f"({prop.name}, has_value, {value})\n"
         
         # Combine both sources with clear separation
         return f"""{component_text}
@@ -149,7 +170,13 @@ Documentation Content:
 {html_text}
 
 Extract knowledge triplets from both the structured metadata and documentation content.
-Focus on relationships between components, properties, and numerical values.
+Focus on relationships between:
+- Components and their properties
+- Properties and their types/values
+- Components and numerical values
+- Properties and numerical values
+
+For numerical values, create explicit relationships to either the component or its properties.
 """
 
     def extract_knowledge_graph(self,
@@ -162,15 +189,15 @@ Focus on relationships between components, properties, and numerical values.
             storybook_root = soup.find('div', id='storybook-root')
             error_div = soup.find('div', class_='sb-nopreview')
             
-            # Check if this is an error page with no valid content
+            # Only treat as error page if we have explicit error message AND no valid content
             if (error_div and "Sorry, but you" in error_div.get_text() and
-                (not storybook_root or len(storybook_root.get_text(strip=True)) < 50)):
-                logger.error("Invalid HTML content - appears to be an error page with no component content")
-                return self._manual_extraction(component_data)
+                not storybook_root and len(html_content) < 500):
+                logger.warning("Possible error page detected - but attempting extraction anyway")
             
             # Check for minimum viable content
             if len(html_content) < 100:
-                logger.error("HTML content too short - likely invalid")
+                logger.error(f"HTML content too short ({len(html_content)} chars) - likely invalid")
+                logger.debug(f"Raw content preview: {html_content[:200]}...")
                 return self._manual_extraction(component_data)
             
             # Prepare document content
@@ -185,7 +212,15 @@ Focus on relationships between components, properties, and numerical values.
                 
                 async def test_llm_connection():
                     try:
-                        return await self.llm.acomplete("Test connection")
+                        test_prompt = "Extract knowledge triplets from: 'Button component has property color with values red, blue, green'"
+                        logger.debug(f"Sending test prompt to LLM: {test_prompt}")
+                        response = await self.llm.acomplete(test_prompt)
+                        logger.debug(f"Received test response: {response}")
+                        
+                        # Validate response contains expected triplet format
+                        if not any(x in str(response) for x in ["(", ")", ","]):
+                            raise ValueError("LLM response does not contain valid triplet format")
+                        return response
                     except Exception as e:
                         logger.error(f"LLM request failed: {e}")
                         raise
@@ -203,117 +238,84 @@ Focus on relationships between components, properties, and numerical values.
                 logger.error(f"LLM connection failed: {e}")
                 return self._manual_extraction(component_data)
             
-            # Define unified schema for extraction with enhanced node types
-            schema = {
-                "nodes": [
-                    {
-                        "label": "Component",
-                        "properties": {
-                            "name": "string",
-                            "description": "string"
-                        }
-                    },
-                    {
-                        "label": "Property",
-                        "properties": {
-                            "name": "string",
-                            "type": "string",
-                            "description": "string"
-                        }
-                    },
-                    {
-                        "label": "Value",
-                        "properties": {
-                            "value": "string",
-                            "unit": "string"
-                        }
-                    }
-                ],
-                "relationships": [
-                    {
-                        "label": "has_property",
-                        "source": "Component",
-                        "target": "Property"
-                    },
-                    {
-                        "label": "has_value",
-                        "source": "Property",
-                        "target": "Value"
-                    }
-                ]
-            }
-            logger.debug(f"Using schema: {schema}")
+            # Initialize DynamicLLMPathExtractor with supported configuration
+            logger.debug("Initializing DynamicLLMPathExtractor")
+            from llama_index.core.indices.property_graph import DynamicLLMPathExtractor
+            path_extractor = DynamicLLMPathExtractor(
+                llm=Settings.llm,
+                num_workers=4  # Only supported parameter
+            )
+            logger.debug(f"Initialized DynamicLLMPathExtractor with LLM: {Settings.llm}")
             
-            # Initialize SchemaLLMPathExtractor with enhanced logging
-            logger.debug("Initializing SchemaLLMPathExtractor")
-            path_extractor = SchemaLLMPathExtractor(llm=Settings.llm)
-            
-            # Log extractor configuration
-            logger.debug(f"SchemaLLMPathExtractor initialized with LLM: {str(Settings.llm)}")
-            logger.debug(f"Using schema: {schema}")
-
-            # Create PropertyGraphIndex with schema and enhanced logging
-            logger.debug("Creating PropertyGraphIndex")
+            # Create PropertyGraphIndex with retries and enhanced logging
+            logger.debug("Creating PropertyGraphIndex with retries")
             graph_store = SimpleGraphStore()
             logger.debug(f"Document text length: {len(document_text)} chars")
             
-            try:
-                # Create index with sync method but proper event loop management
-                import nest_asyncio
-                nest_asyncio.apply()
-                
-                # Create index with proper event loop management
-                for attempt in range(3):
-                    try:
-                        loop = asyncio.get_event_loop()
-                        if loop.is_closed():
-                            loop = asyncio.new_event_loop()
-                            asyncio.set_event_loop(loop)
-                            
-                        index = PropertyGraphIndex.from_documents(
-                            documents=[Document(text=document_text)],
-                            llm=self.llm,
-                            graph_store=graph_store,
-                            path_extractor=path_extractor,
-                            max_triplets_per_chunk=20,
-                            schema=schema,
-                            show_progress=True
-                        )
-                        break
-                    except RuntimeError as e:
-                        if "Event loop is closed" in str(e) and attempt < 2:
-                            logger.warning(f"Event loop error (attempt {attempt+1}) - creating new loop")
-                            loop = asyncio.new_event_loop()
-                            asyncio.set_event_loop(loop)
+            max_attempts = 3
+            for attempt in range(max_attempts):
+                try:
+                    # Create index with proper event loop management
+                    import nest_asyncio
+                    nest_asyncio.apply()
+                    
+                    loop = asyncio.get_event_loop()
+                    if loop.is_closed():
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                    
+                    # Log the document text being sent for extraction
+                    logger.debug(f"Attempt {attempt+1}/{max_attempts} - Document text:\n{document_text[:500]}...")
+                    
+                    index = PropertyGraphIndex.from_documents(
+                        documents=[Document(text=document_text)],
+                        llm=self.llm,
+                        graph_store=graph_store,
+                        path_extractor=path_extractor,
+                        max_triplets_per_chunk=30,  # Increased from 20
+                        show_progress=True,
+                        chunk_size=512  # Smaller chunks for better processing
+                    )
+                    
+                    # Verify and log extracted paths with more tolerance
+                    triples = graph_store.get(subj='')
+                    if not triples:
+                        if attempt < max_attempts - 1:
+                            logger.warning(f"Empty graph store on attempt {attempt+1} - retrying")
                             continue
-                        raise
-                logger.debug("PropertyGraphIndex created successfully")
-            except Exception as e:
-                logger.error(f"Failed to create PropertyGraphIndex: {e}")
-                return self._manual_extraction(component_data)
-            
-            # Log graph store state after extraction attempt
-            all_triples = graph_store.get(subj='')
-            logger.debug(f"Graph store contains {len(all_triples)} triples after PropertyGraphIndex processing")
-            
-            if all_triples:
-                logger.debug(f"Sample triple: {all_triples[0]}")
+                        logger.warning("Graph store is empty after all attempts")
+                        return self._manual_extraction(component_data)
+                    
+                    logger.info(f"Extracted {len(triples)} paths on attempt {attempt+1}:")
+                    for i, (s, p, o) in enumerate(triples[:10]):  # Log more samples
+                        logger.info(f"Path {i+1}: {s} -> {p} -> {o}")
+                    
+                    # More lenient validation of path structure
+                    invalid_paths = [t for t in triples if not all(isinstance(x, str) and x.strip() for x in t)]
+                    if invalid_paths:
+                        logger.warning(f"Found {len(invalid_paths)} invalid paths (will attempt to filter)")
+                        triples = [t for t in triples if all(isinstance(x, str) and x.strip() for x in t)]
+                        if not triples:
+                            logger.warning("All paths filtered as invalid")
+                            return self._manual_extraction(component_data)
+                    
+                    break
+                except Exception as e:
+                    logger.error(f"KG extraction attempt {attempt+1} failed: {str(e)}")
+                    if attempt == max_attempts - 1:
+                        logger.error("All extraction attempts failed")
+                        return self._manual_extraction(component_data)
             
             # Extract entities and relations from the graph store
             logger.debug("Extracting KG data from graph store")
             entities, relations = self._extract_kg_data(graph_store, component_data.metadata.name)
             
-            # Log extraction results
-            logger.debug(f"Extracted {len(entities)} entities and {len(relations)} relations")
-            
-            # Fallback to manual extraction if no results
-            if not entities:
-                logger.warning("LLM extraction failed - falling back to manual extraction")
-                logger.debug(f"Graph store contents: {graph_store.get(subj='')}")
-                logger.debug(f"Document text length: {len(document_text)}")
+            # More tolerant check for results
+            if len(entities) < 3:  # Require at least 3 entities to consider successful
+                logger.warning(f"Insufficient entities extracted ({len(entities)}) - falling back to manual")
                 return self._manual_extraction(component_data)
             
-            logger.info(f"Extracted {len(entities)} entities and {len(relations)} relations using SchemaLLMPathExtractor")
+            logger.info(f"Successfully extracted {len(entities)} entities and {len(relations)} relations using DynamicLLMPathExtractor")
             
             return KGResult(
                 entities=entities,
@@ -323,7 +325,8 @@ Focus on relationships between components, properties, and numerical values.
                     "document_length": len(document_text),
                     "extraction_model": str(Settings.llm),
                     "schema_version": "1.0",
-                    "method": "SchemaLLMPathExtractor"
+                    "method": "DynamicLLMPathExtractor",
+                    "attempts": max_attempts
                 }
             )
             
