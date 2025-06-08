@@ -3,7 +3,18 @@ playwright==1.45.0
 beautifulsoup4==4.12.3
 python-dotenv==1.0.1
 aiofiles==23.2.1
-pydantic==2.7.1
+pydantic==2.8.2
+nest-asyncio==1.6.0
+
+# LlamaIndex dependencies for extraction
+llama-index==0.12.41
+llama-index-core==0.12.41
+llama-index-graph-stores-kuzu==0.7.0
+llama-index-llms-openai==0.4.4
+llama-index-llms-deepseek==0.1.2
+llama-index-embeddings-openai==0.3.1
+openai==1.84.0
+kuzu>=0.9.0
 
 # Install Playwright browsers (run after installing dependencies)
 # playwright install chromium
